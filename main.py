@@ -2,7 +2,7 @@ import sys
 import threading
 import struct
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QComboBox, QHBoxLayout, QVBoxLayout, QPlainTextEdit, QLineEdit, QMessageBox
@@ -17,6 +17,7 @@ import serial.tools.list_ports
 FRAME_DELIMITER_BYTE = 22  # 0b00010110
 FRAME_DELIMITER_BITS = '00010110'
 FLAG_VALUE = FRAME_DELIMITER_BYTE
+MAX_PAYLOAD_SIZE = 65535
 
 
 # ---------------- bit/byte helper functions ----------------
@@ -49,27 +50,50 @@ def checksum16(data: bytes) -> int:
     return sum(data) & 0xFFFF
 
 
-# ---------------- bit-stuffing ----------------
+# ---------------- bit-stuffing (CORRECTED) ----------------
+# ---------------- bit-stuffing (FIXED) ----------------
 def bit_stuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
-    prefix = pattern_to_avoid[:-1]          # '0001011'
-    last = pattern_to_avoid[-1]             # '0'
-    stuff = '1' if last == '0' else '0'
-    stuffed = []
-    i = 0
-    while i < len(bits):
-        stuffed.append(bits[i])
-        if len(stuffed) >= len(prefix) and ''.join(stuffed[-len(prefix):]) == prefix:
-            if i + 1 < len(bits) and bits[i + 1] == last:
-                stuffed.append(stuff)
-        i += 1
-    return ''.join(stuffed)
+    """
+    Вставляем complement(last_bit) сразу после того, как в выходе
+    оказался prefix + last_bit. Никаких lookahead-скипов входных битов.
+    """
+    prefix = pattern_to_avoid[:-1]
+    last_bit = pattern_to_avoid[-1]
+    # вставляем противоположный бит к последнему биту шаблона
+    stuff_bit = '1' if last_bit == '0' else '0'
+
+    result = []
+    for b in bits:
+        result.append(b)
+        # если только что в выход ушёл prefix + last_bit — вставляем stuff_bit
+        if len(result) >= len(prefix) + 1 and ''.join(result[-(len(prefix) + 1):]) == prefix + last_bit:
+            result.append(stuff_bit)
+    return ''.join(result)
 
 
 def bit_unstuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
-    last = pattern_to_avoid[-1]
-    stuff = '1' if last == '0' else '0'
-    stuffed_seq = pattern_to_avoid[:-1] + stuff + last
-    return bits.replace(stuffed_seq, pattern_to_avoid)
+    """
+    Удаляем stuff_bit, если он следует сразу после prefix + last_bit.
+    Симметрично исправлённой bit_stuff.
+    """
+    prefix = pattern_to_avoid[:-1]
+    last_bit = pattern_to_avoid[-1]
+    stuff_bit = '1' if last_bit == '0' else '0'
+
+    result = []
+    i = 0
+    while i < len(bits):
+        result.append(bits[i])
+        # если в выходе уже prefix + last_bit и следующий входной бит — stuff_bit,
+        # пропускаем этот следующий (удаляем его)
+        if (len(result) >= len(prefix) + 1
+            and ''.join(result[-(len(prefix) + 1):]) == prefix + last_bit
+            and i + 1 < len(bits)
+            and bits[i + 1] == stuff_bit):
+            i += 1  # пропустить stuff_bit во входе (не добавлять в result)
+        i += 1
+    return ''.join(result)
+
 
 
 # ---------------- Frame dataclass ----------------
@@ -78,13 +102,11 @@ class Frame:
     flag: int
     src: int
     dst: int
-    ftype: int
     payload: bytes
 
     def to_bytes(self, do_bit_stuff: bool = True) -> bytes:
         length = len(self.payload)
-        header = struct.pack('!BBBBH', self.flag & 0xFF, self.src & 0xFF,
-                             self.dst & 0xFF, self.ftype & 0xFF, length)
+        header = struct.pack('!BBBH', self.flag & 0xFF, self.src & 0xFF, self.dst & 0xFF, length)
         data_to_checksum = header + self.payload
         chk = checksum16(data_to_checksum)
         data_with_chk = data_to_checksum + struct.pack('!H', chk)
@@ -107,18 +129,18 @@ class Frame:
                 bits = bytes_to_bits(inner)
                 unstuffed = bit_unstuff(bits, FRAME_DELIMITER_BITS)
                 inner = bits_to_bytes(unstuffed)
-            if len(inner) < 8:
+            if len(inner) < 7:
                 return None
-            flag, src, dst, ftype, length = struct.unpack('!BBBBH', inner[:6])
-            expected = 6 + length + 2
+            flag, src, dst, length = struct.unpack('!BBBH', inner[:5])
+            expected = 5 + length + 2
             if len(inner) < expected:
                 return None
-            payload = inner[6:6 + length]
-            chk_recv, = struct.unpack('!H', inner[6 + length:6 + length + 2])
-            chk_calc = checksum16(inner[:6 + length])
+            payload = inner[5:5 + length]
+            chk_recv, = struct.unpack('!H', inner[5 + length:5 + length + 2])
+            chk_calc = checksum16(inner[:5 + length])
             if chk_recv != chk_calc:
                 return None
-            return Frame(flag=flag, src=src, dst=dst, ftype=ftype, payload=payload)
+            return Frame(flag=flag, src=src, dst=dst, payload=payload)
         except Exception:
             return None
 
@@ -217,12 +239,12 @@ class SerialWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("COM Messenger (frames + bit-stuffing)")
+        self.setWindowTitle("COM Messenger (frames + bit-stuffing + fragmentation)")
         self.resize(960, 560)
         self.worker_send = None
         self.worker_receive = None
 
-        # UI elements – идентичны первой лабораторной
+        # UI elements
         self.port_send_cb = QComboBox()
         self.port_receive_cb = QComboBox()
         self.refresh_ports_btn = QPushButton("Refresh COM")
@@ -232,6 +254,7 @@ class MainWindow(QMainWindow):
         self.bytes_cb = QComboBox()
 
         self.send_input = QLineEdit()
+        self.send_input.setMaxLength(2147483647)
         self.send_btn = QPushButton("Send")
         self.send_btn.setIcon(QIcon.fromTheme("mail-send"))
 
@@ -241,6 +264,8 @@ class MainWindow(QMainWindow):
         self.recv_area.setReadOnly(True)
         self.log_area = QPlainTextEdit()
         self.log_area.setReadOnly(True)
+
+        self._recv_fragments: List[bytes] = []
 
         self._build_ui()
         self._populate_defaults()
@@ -253,7 +278,6 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
-        # Верхняя панель – 100% как в первой лабораторной
         row1 = QHBoxLayout()
         row1.setSpacing(8)
         row1.addWidget(QLabel("TX Port:"))
@@ -266,7 +290,6 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.connect_btn)
         main_layout.addLayout(row1)
 
-        # Строка ввода
         msg_row = QHBoxLayout()
         msg_row.setSpacing(8)
         msg_row.addWidget(QLabel("Message:"))
@@ -274,7 +297,6 @@ class MainWindow(QMainWindow):
         msg_row.addWidget(self.send_btn)
         main_layout.addLayout(msg_row)
 
-        # Три колонки
         split_row = QHBoxLayout()
         split_row.setSpacing(10)
 
@@ -299,53 +321,16 @@ class MainWindow(QMainWindow):
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #f0f0f5;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
-            QLabel {
-                font-size: 14px;
-                color: #333;
-            }
-            QComboBox {
-                padding: 5px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                background-color: #fff;
-                font-size: 14px;
-                color: #000000;
-            }
+            QMainWindow, QWidget { background-color: #f0f0f5; font-family: 'Segoe UI', Arial, sans-serif; }
+            QLabel { font-size: 14px; color: #333; }
+            QComboBox { padding: 5px; border: 1px solid #ccc; border-radius: 4px; background-color: #fff; font-size: 14px; color: #000000; }
             QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView {
-                color: #000000;
-                background-color: #fff;
-            }
-            QPushButton {
-                padding: 8px 16px;
-                border: none;
-                border-radius: 4px;
-                background-color: #0078d4;
-                color: white;
-                font-size: 14px;
-            }
+            QComboBox QAbstractItemView { color: #000000; background-color: #fff; }
+            QPushButton { padding: 8px 16px; border: none; border-radius: 4px; background-color: #0078d4; color: white; font-size: 14px; }
             QPushButton:hover { background-color: #005ea2; }
             QPushButton:pressed { background-color: #004080; }
-            QLineEdit {
-                padding: 5px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                background-color: #fff;
-                font-size: 14px;
-                color: #000000;
-            }
-            QPlainTextEdit {
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                background-color: #fff;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 13px;
-                color: #000000;
-            }
+            QLineEdit { padding: 5px; border: 1px solid #ccc; border-radius: 4px; background-color: #fff; font-size: 14px; color: #000000; }
+            QPlainTextEdit { border: 1px solid #ccc; border-radius: 4px; background-color: #fff; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; color: #000000; }
             QMessageBox { background-color: #f0f0f5; }
         """)
         self.setFont(QFont("Segoe UI", 10))
@@ -364,20 +349,15 @@ class MainWindow(QMainWindow):
     def _refresh_ports(self):
         self.port_send_cb.clear()
         self.port_receive_cb.clear()
-
-        # Плейсхолдеры
         self.port_send_cb.addItem("Select port", "")
         self.port_receive_cb.addItem("Select port", "")
-
         ports = serial.tools.list_ports.comports()
         for p in ports:
             self.port_send_cb.addItem(p.device, p.device)
             self.port_receive_cb.addItem(p.device, p.device)
-
-        if self.port_send_cb.count() == 1:  # только placeholder
+        if self.port_send_cb.count() == 1:
             self.port_send_cb.addItem("No COM", "")
             self.port_receive_cb.addItem("No COM", "")
-
         self.port_send_cb.setCurrentIndex(0)
         self.port_receive_cb.setCurrentIndex(0)
 
@@ -385,19 +365,11 @@ class MainWindow(QMainWindow):
         if self.worker_send is None and self.worker_receive is None:
             send_port = self.port_send_cb.currentData()
             recv_port = self.port_receive_cb.currentData()
-
-            if (not send_port or not recv_port or
-                send_port == recv_port or send_port == "" or recv_port == ""):
-                QMessageBox.warning(self, "Error",
-                                    "Select different valid COM ports for TX and RX.")
+            if (not send_port or not recv_port or send_port == recv_port or send_port == "" or recv_port == ""):
+                QMessageBox.warning(self, "Error", "Select different valid COM ports for TX and RX.")
                 return
 
-            bytesize_map = {
-                "5": serial.FIVEBITS,
-                "6": serial.SIXBITS,
-                "7": serial.SEVENBITS,
-                "8": serial.EIGHTBITS
-            }
+            bytesize_map = {"5": serial.FIVEBITS, "6": serial.SIXBITS, "7": serial.SEVENBITS, "8": serial.EIGHTBITS}
             bs = bytesize_map.get(self.bytes_cb.currentText(), serial.EIGHTBITS)
 
             self.worker_send = SerialWorker(send_port, bytesize=bs)
@@ -426,6 +398,27 @@ class MainWindow(QMainWindow):
             self.connect_btn.setIcon(QIcon.fromTheme("network-connect"))
             self.log("Ports closed")
 
+    def _format_frame_dump(self, frm: Frame, fragment_num: int, total_fragments: int) -> str:
+        length = len(frm.payload)
+        header = struct.pack('!BBBH', frm.flag, frm.src, frm.dst, length)
+        chk = checksum16(header + frm.payload)
+        data_with_chk = header + frm.payload + struct.pack('!H', chk)
+        bits = bytes_to_bits(data_with_chk)
+        stuffed = bit_stuff(bits, FRAME_DELIMITER_BITS)
+        # Показываем БИТЫ без паддинга
+        stuffed_bits_grouped = group_bits_str(stuffed)
+
+        return f"""flag: {bin_str(frm.flag)}
+tx: {bin_str(frm.src)}
+rx: {bin_str(frm.dst)}
+data_length: {bin_str(length, 16)}
+data: {bytes_to_binary(frm.payload)}
+checksum: {bin_str(chk, 16)}
+--- Stuffed Frame Data ---
+{stuffed_bits_grouped}
+[Fragment {fragment_num}/{total_fragments}]
+"""
+
     def _on_send_clicked(self):
         if self.worker_send is None:
             QMessageBox.warning(self, "Error", "Send port not open")
@@ -435,46 +428,50 @@ class MainWindow(QMainWindow):
             return
 
         payload = text.encode("utf-8")
-        frm = Frame(flag=FLAG_VALUE, src=1, dst=2, ftype=0x10, payload=payload)
-        tx = frm.to_bytes(do_bit_stuff=True)
+        chunks = [payload[i:i + MAX_PAYLOAD_SIZE] for i in range(0, len(payload), MAX_PAYLOAD_SIZE)]
+        total_fragments = len(chunks)
 
-        # Для отображения в "Sent frames"
-        header = struct.pack('!BBBBH', frm.flag, frm.src, frm.dst, frm.ftype, len(payload))
-        chk = checksum16(header + payload)
-        bits = bytes_to_bits(header + payload + struct.pack('!H', chk))
-        stuffed = bit_stuff(bits, FRAME_DELIMITER_BITS)
-        stuffed_bytes = bits_to_bytes(stuffed)
-        stuffed_bits_grouped = group_bits_str(bytes_to_bits(stuffed_bytes))
+        self.log(f"Splitting message into {total_fragments} fragment(s)")
 
-        ok = self.worker_send.write(tx)
-        if ok:
-            sent_text = f"""flag: {bin_str(frm.flag)}
-src: {bin_str(frm.src)}
-dst: {bin_str(frm.dst)}
-ftype: {bin_str(frm.ftype)}
-data_length: {bin_str(len(payload), 16)}
-data: {bytes_to_binary(payload)}
-checksum: {bin_str(chk, 16)}
---- Stuffed Frame Data ---
-{stuffed_bits_grouped}
-"""
-            self.sent_area.appendPlainText(sent_text)
-            self.log(f"Frame sent ({len(tx)} bytes).")
-        else:
-            self.log("Send failed")
+        for i, chunk in enumerate(chunks):
+            frm = Frame(flag=FLAG_VALUE, src=1, dst=2, payload=chunk)
+            tx = frm.to_bytes(do_bit_stuff=True)
+
+            dump_text = self._format_frame_dump(frm, i + 1, total_fragments)
+            self.sent_area.appendPlainText(dump_text)
+
+            if not self.worker_send.write(tx):
+                self.log("Send failed")
+                return
+            self.log(f"Fragment {i+1}/{total_fragments} sent ({len(tx)} bytes)")
+
         self.send_input.clear()
 
     def _on_data_received(self, data: bytes):
         frm = Frame.from_bytes(data, do_bit_unstuff=True)
-        if frm:
-            try:
-                msg = frm.payload.decode("utf-8")
-                self.recv_area.appendPlainText(msg)
-            except Exception:
-                self.recv_area.appendPlainText(f"[binary] {frm.payload.hex(' ')}")
-            self.log("Message received.")
-        else:
+        if not frm:
             self.log("Invalid or corrupted frame.")
+            return
+
+        if not self._recv_fragments:
+            self._recv_fragments = [frm.payload]
+            self.log(f"Started reassembling (fragment 1, {len(frm.payload)} bytes)")
+        else:
+            self._recv_fragments.append(frm.payload)
+            self.log(f"Received fragment {len(self._recv_fragments)}")
+
+        if len(frm.payload) < MAX_PAYLOAD_SIZE:
+            full_payload = b''.join(self._recv_fragments)
+            try:
+                msg = full_payload.decode("utf-8")
+                self.recv_area.appendPlainText(msg)
+                self.log(f"Message reassembled: {len(full_payload)} bytes in {len(self._recv_fragments)} fragments")
+            except Exception:
+                self.recv_area.appendPlainText(f"[binary] {full_payload.hex(' ')}")
+                self.log("Binary data received")
+            self._recv_fragments = []
+        else:
+            self.log("Waiting for more fragments...")
 
     def _on_error(self, text: str):
         self.log(f"ERROR: {text}")
