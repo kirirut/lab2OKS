@@ -2,7 +2,7 @@ import sys
 import threading
 import struct
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QComboBox, QHBoxLayout, QVBoxLayout, QPlainTextEdit, QLineEdit, QMessageBox
@@ -11,7 +11,6 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon
 import serial
 import serial.tools.list_ports
-
 
 # ---------------- Frame structure / constants ----------------
 FRAME_DELIMITER_BYTE = 22  # 0b00010110
@@ -50,32 +49,8 @@ def checksum16(data: bytes) -> int:
     return sum(data) & 0xFFFF
 
 
-# ---------------- bit-stuffing (CORRECTED) ----------------
-# ---------------- bit-stuffing (FIXED) ----------------
+# ---------------- bit-stuffing ----------------
 def bit_stuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
-    """
-    Вставляем complement(last_bit) сразу после того, как в выходе
-    оказался prefix + last_bit. Никаких lookahead-скипов входных битов.
-    """
-    prefix = pattern_to_avoid[:-1]
-    last_bit = pattern_to_avoid[-1]
-    # вставляем противоположный бит к последнему биту шаблона
-    stuff_bit = '1' if last_bit == '0' else '0'
-
-    result = []
-    for b in bits:
-        result.append(b)
-        # если только что в выход ушёл prefix + last_bit — вставляем stuff_bit
-        if len(result) >= len(prefix) + 1 and ''.join(result[-(len(prefix) + 1):]) == prefix + last_bit:
-            result.append(stuff_bit)
-    return ''.join(result)
-
-
-def bit_unstuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
-    """
-    Удаляем stuff_bit, если он следует сразу после prefix + last_bit.
-    Симметрично исправлённой bit_stuff.
-    """
     prefix = pattern_to_avoid[:-1]
     last_bit = pattern_to_avoid[-1]
     stuff_bit = '1' if last_bit == '0' else '0'
@@ -84,32 +59,39 @@ def bit_unstuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
     i = 0
     while i < len(bits):
         result.append(bits[i])
-        # если в выходе уже prefix + last_bit и следующий входной бит — stuff_bit,
-        # пропускаем этот следующий (удаляем его)
-        if (len(result) >= len(prefix) + 1
-            and ''.join(result[-(len(prefix) + 1):]) == prefix + last_bit
-            and i + 1 < len(bits)
-            and bits[i + 1] == stuff_bit):
-            i += 1  # пропустить stuff_bit во входе (не добавлять в result)
+        if ''.join(result).endswith(prefix):
+            if i + 1 < len(bits) and bits[i + 1] == last_bit:
+                result.append(stuff_bit)
         i += 1
+
     return ''.join(result)
 
+
+def bit_unstuff(bits: str, pattern_to_avoid: str = FRAME_DELIMITER_BITS) -> str:
+    prefix = pattern_to_avoid[:-1]
+    last_bit = pattern_to_avoid[-1]
+    stuff_bit = '1' if last_bit == '0' else '0'
+
+    search_pattern = prefix + stuff_bit + last_bit
+
+    return bits.replace(search_pattern, prefix + last_bit)
 
 
 # ---------------- Frame dataclass ----------------
 @dataclass
 class Frame:
     flag: int
-    src: int
-    dst: int
+    tx: int
+    rx: int
     payload: bytes
+    checksum: int = 0
 
     def to_bytes(self, do_bit_stuff: bool = True) -> bytes:
         length = len(self.payload)
-        header = struct.pack('!BBBH', self.flag & 0xFF, self.src & 0xFF, self.dst & 0xFF, length)
+        header = struct.pack('!BBBH', self.flag & 0xFF, self.tx & 0xFF, self.rx & 0xFF, length)
         data_to_checksum = header + self.payload
-        chk = checksum16(data_to_checksum)
-        data_with_chk = data_to_checksum + struct.pack('!H', chk)
+        self.checksum = checksum16(data_to_checksum)
+        data_with_chk = data_to_checksum + struct.pack('!H', self.checksum)
 
         if do_bit_stuff:
             bits = bytes_to_bits(data_with_chk)
@@ -120,27 +102,43 @@ class Frame:
             return bytes([FRAME_DELIMITER_BYTE]) + data_with_chk + bytes([FRAME_DELIMITER_BYTE])
 
     @staticmethod
-    def from_bytes(data: bytes, do_bit_unstuff: bool = True) -> Optional['Frame']:
+    def from_bytes(data: bytes, do_bit_unstuff: bool = True) -> Optional[Tuple['Frame', str]]:
         try:
             if len(data) < 2 or data[0] != FRAME_DELIMITER_BYTE or data[-1] != FRAME_DELIMITER_BYTE:
                 return None
+
             inner = data[1:-1]
+            unstuffed_bits = ""
+
             if do_bit_unstuff:
                 bits = bytes_to_bits(inner)
-                unstuffed = bit_unstuff(bits, FRAME_DELIMITER_BITS)
-                inner = bits_to_bytes(unstuffed)
-            if len(inner) < 7:
+                unstuffed_bits = bit_unstuff(bits, FRAME_DELIMITER_BITS)
+                inner = bits_to_bytes(unstuffed_bits)
+
+            if len(inner) < 7:  # Header (5) + Checksum (2)
                 return None
-            flag, src, dst, length = struct.unpack('!BBBH', inner[:5])
-            expected = 5 + length + 2
-            if len(inner) < expected:
+
+            flag, tx, rx, length = struct.unpack('!BBBH', inner[:5])
+
+            expected_payload_end = 5 + length
+            expected_frame_end = expected_payload_end + 2
+
+            if len(inner) < expected_frame_end:
                 return None
-            payload = inner[5:5 + length]
-            chk_recv, = struct.unpack('!H', inner[5 + length:5 + length + 2])
-            chk_calc = checksum16(inner[:5 + length])
+
+            payload = inner[5:expected_payload_end]
+            chk_recv, = struct.unpack('!H', inner[expected_payload_end:expected_frame_end])
+
+            chk_calc = checksum16(inner[:expected_payload_end])
+
             if chk_recv != chk_calc:
                 return None
-            return Frame(flag=flag, src=src, dst=dst, payload=payload)
+
+            frame = Frame(flag=flag, tx=tx, rx=rx, payload=payload, checksum=chk_recv)
+            return frame, unstuffed_bits
+
+        except (struct.error, IndexError):
+            return None
         except Exception:
             return None
 
@@ -209,12 +207,13 @@ class SerialWorker(QThread):
                 break
             if start > 0:
                 del self._buffer[:start]
-                start = 0
-            end = self._buffer.find(bytes([FRAME_DELIMITER_BYTE]), start + 1)
+
+            end = self._buffer.find(bytes([FRAME_DELIMITER_BYTE]), 1)
             if end == -1:
                 break
-            frame = bytes(self._buffer[:end + 1])
-            self.data_received.emit(frame)
+
+            frame_data = bytes(self._buffer[:end + 1])
+            self.data_received.emit(frame_data)
             del self._buffer[:end + 1]
 
     def write(self, data: bytes) -> bool:
@@ -355,9 +354,9 @@ class MainWindow(QMainWindow):
         for p in ports:
             self.port_send_cb.addItem(p.device, p.device)
             self.port_receive_cb.addItem(p.device, p.device)
-        if self.port_send_cb.count() == 1:
-            self.port_send_cb.addItem("No COM", "")
-            self.port_receive_cb.addItem("No COM", "")
+        if len(ports) < 2:
+            self.port_send_cb.addItem("No COM ports", "")
+            self.port_receive_cb.addItem("No COM ports", "")
         self.port_send_cb.setCurrentIndex(0)
         self.port_receive_cb.setCurrentIndex(0)
 
@@ -398,26 +397,40 @@ class MainWindow(QMainWindow):
             self.connect_btn.setIcon(QIcon.fromTheme("network-connect"))
             self.log("Ports closed")
 
+    def _format_received_frame_dump(self, frm: Frame, unstuffed_bits: str) -> str:
+        unstuffed_bits_grouped = group_bits_str(unstuffed_bits)
+
+        return f"""--- FRAME ---
+flag: {bin_str(frm.flag)}
+tx: {bin_str(frm.tx)}
+rx: {bin_str(frm.rx)}
+data_length: {bin_str(len(frm.payload), 16)}
+data: {bytes_to_binary(frm.payload)}
+checksum: {bin_str(frm.checksum, 16)} 
+--- Debitstuffed Frame Data ---
+{unstuffed_bits_grouped}
+"""
+
     def _format_frame_dump(self, frm: Frame, fragment_num: int, total_fragments: int) -> str:
         length = len(frm.payload)
-        header = struct.pack('!BBBH', frm.flag, frm.src, frm.dst, length)
-        chk = checksum16(header + frm.payload)
-        data_with_chk = header + frm.payload + struct.pack('!H', chk)
-        bits = bytes_to_bits(data_with_chk)
-        stuffed = bit_stuff(bits, FRAME_DELIMITER_BITS)
-        # Показываем БИТЫ без паддинга
-        stuffed_bits_grouped = group_bits_str(stuffed)
+        header = struct.pack('!BBH', frm.tx, frm.rx, length)  # без флага
+        data_to_stuff = header + frm.payload + struct.pack('!H', frm.checksum)
+        bits = bytes_to_bits(data_to_stuff)
+        stuffed_bits = bit_stuff(bits, FRAME_DELIMITER_BITS)
+        if len(stuffed_bits) % 8 != 0:
+            stuffed_bits += '0' * (8 - len(stuffed_bits) % 8)
+        stuffed_bits_grouped = group_bits_str(stuffed_bits)
 
-        return f"""flag: {bin_str(frm.flag)}
-tx: {bin_str(frm.src)}
-rx: {bin_str(frm.dst)}
-data_length: {bin_str(length, 16)}
-data: {bytes_to_binary(frm.payload)}
-checksum: {bin_str(chk, 16)}
---- Stuffed Frame Data ---
-{stuffed_bits_grouped}
-[Fragment {fragment_num}/{total_fragments}]
-"""
+        return f"""--- SENDING FRAME {fragment_num}/{total_fragments} ---
+    flag: {bin_str(frm.flag)}
+    tx: {bin_str(frm.tx)}
+    rx: {bin_str(frm.rx)}
+    data_length: {bin_str(length, 16)}
+    data: {bytes_to_binary(frm.payload)}
+    checksum: {bin_str(frm.checksum, 16)}
+    --- Stuffed Frame Data---
+    {bin_str(frm.flag)} {stuffed_bits_grouped}
+    """
 
     def _on_send_clicked(self):
         if self.worker_send is None:
@@ -434,41 +447,49 @@ checksum: {bin_str(chk, 16)}
         self.log(f"Splitting message into {total_fragments} fragment(s)")
 
         for i, chunk in enumerate(chunks):
-            frm = Frame(flag=FLAG_VALUE, src=1, dst=2, payload=chunk)
-            tx = frm.to_bytes(do_bit_stuff=True)
+            frm = Frame(flag=FLAG_VALUE, tx=1, rx=2, payload=chunk)
+            tx_bytes = frm.to_bytes(do_bit_stuff=True)
 
             dump_text = self._format_frame_dump(frm, i + 1, total_fragments)
             self.sent_area.appendPlainText(dump_text)
 
-            if not self.worker_send.write(tx):
+            if not self.worker_send.write(tx_bytes):
                 self.log("Send failed")
                 return
-            self.log(f"Fragment {i+1}/{total_fragments} sent ({len(tx)} bytes)")
+            self.log(f"Fragment {i + 1}/{total_fragments} sent ({len(tx_bytes)} bytes)")
 
         self.send_input.clear()
 
     def _on_data_received(self, data: bytes):
-        frm = Frame.from_bytes(data, do_bit_unstuff=True)
-        if not frm:
-            self.log("Invalid or corrupted frame.")
+        self.log(f"Raw data received ({len(data)} bytes)")
+
+        result = Frame.from_bytes(data, do_bit_unstuff=True)
+        if not result:
+            self.log("Failed to parse frame (invalid structure or checksum)")
             return
 
-        if not self._recv_fragments:
-            self._recv_fragments = [frm.payload]
-            self.log(f"Started reassembling (fragment 1, {len(frm.payload)} bytes)")
-        else:
-            self._recv_fragments.append(frm.payload)
-            self.log(f"Received fragment {len(self._recv_fragments)}")
+        frm, unstuffed_bits = result
+
+        dump_text = self._format_received_frame_dump(frm, unstuffed_bits)
+        self.recv_area.appendPlainText(dump_text)
+
+        self._recv_fragments.append(frm.payload)
+        self.log(f"Received and parsed fragment {len(self._recv_fragments)}. Payload size: {len(frm.payload)} bytes.")
 
         if len(frm.payload) < MAX_PAYLOAD_SIZE:
             full_payload = b''.join(self._recv_fragments)
             try:
                 msg = full_payload.decode("utf-8")
-                self.recv_area.appendPlainText(msg)
-                self.log(f"Message reassembled: {len(full_payload)} bytes in {len(self._recv_fragments)} fragments")
-            except Exception:
-                self.recv_area.appendPlainText(f"[binary] {full_payload.hex(' ')}")
-                self.log("Binary data received")
+                final_message_text = f"""
+--- MESSAGE---
+{msg}
+---------------------------
+"""
+                self.recv_area.appendPlainText(final_message_text)
+            except UnicodeDecodeError:
+                self.recv_area.appendPlainText(f"[binary data] {full_payload.hex(' ')}")
+                self.log("Binary data received and reassembled.")
+
             self._recv_fragments = []
         else:
             self.log("Waiting for more fragments...")
