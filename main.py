@@ -18,18 +18,18 @@ import serial.tools.list_ports
 class FrameStructure:
     """Хранит и форматирует информацию о разобранном (декадрированном) кадре."""
 
-    def __init__(self, tx_bin: str, rx_bin: str, length_bin: str, data_bin: str,
-                 de_stuffed_body: str, decoded_text: str):
+    def __init__(self, tx_bin: str, rx_bin: str, length_bin: str, data_bin: str):
         self.FLAG = FrameProcessor.FLAG
         self.tx_bin = tx_bin
         self.rx_bin = rx_bin
         self.length_bin = length_bin
         self.data_bin = data_bin
-        self.de_stuffed_body = de_stuffed_body
-        self.decoded_text = decoded_text
 
-    def format_log(self) -> str:
-        """Форматирует техническую информацию о кадре для вывода в лог."""
+    def format_log(self, de_stuffed_body: str, decoded_text: str) -> str:
+        """
+        Форматирует техническую информацию о кадре для вывода в лог.
+        Теперь принимает de_stuffed_body и decoded_text как аргументы.
+        """
 
         # Конвертация бинарных полей в числа для лога
         tx_addr = int(self.tx_bin, 2)
@@ -37,7 +37,7 @@ class FrameStructure:
         data_len_bytes = int(self.length_bin, 2)
 
         # 1. Построение и форматирование ПОЛНОГО декадрированного кадра (FLAG + Body + FLAG)
-        full_de_stuffed_frame = self.FLAG + self.de_stuffed_body + self.FLAG
+        full_de_stuffed_frame = self.FLAG + de_stuffed_body + self.FLAG
         # Форматирование по байтам для лучшей читаемости
         formatted_full_de_stuffed_frame = ' '.join(
             full_de_stuffed_frame[i:i + 8] for i in range(0, len(full_de_stuffed_frame), 8))
@@ -53,6 +53,7 @@ class FrameStructure:
 
         # Поле данных
         log_text += f"Data Bits:        {self.data_bin}\n"
+        log_text += f"Decoded Text:     {decoded_text!r}\n"
 
         # Полный кадр
         log_text += f"De-stuffed Frame (Bytes):\n"
@@ -158,7 +159,7 @@ class FrameProcessor:
         return de_stuffed_result
 
     @staticmethod
-    def build_frame(tx: int, rx: int, data: bytes) -> tuple:
+    def build_frame(tx: int, rx: int, data: bytes) -> dict:
         """Собирает и кадрирует кадр, возвращает данные и бит-строку."""
         tx_bin = bin(tx)[2:].zfill(8)
         rx_bin = bin(rx)[2:].zfill(8)
@@ -768,26 +769,26 @@ class MainWindow(QMainWindow):
             self.log(f"Received data parse error: {frame_parse_result['error']}")
             self.recv_area.appendPlainText(f"[ERROR PARSING] {frame_parse_result['error']}")
         else:
-            # Создаем объект FrameStructure
+            # --- Создаем объект FrameStructure (без de_stuffed_body и decoded_text) ---
             frame_structure = FrameStructure(
                 tx_bin=frame_parse_result['tx_bin'],
                 rx_bin=frame_parse_result['rx_bin'],
                 length_bin=frame_parse_result['length_bin'],
-                data_bin=frame_parse_result['data_bin'],
-                de_stuffed_body=frame_parse_result['de_stuffed_body'],
-                decoded_text=frame_parse_result['decoded_text']
+                data_bin=frame_parse_result['data_bin']
             )
+            # Извлекаем данные для лога из словаря
+            de_stuffed_body = frame_parse_result['de_stuffed_body']
+            decoded_text = frame_parse_result['decoded_text']
 
             # --- Логирование технической информации в Application logs (log_area) ---
-            self.log(frame_structure.format_log())
+            # Передаем de_stuffed_body и decoded_text в метод format_log
+            self.log(frame_structure.format_log(de_stuffed_body, decoded_text))
 
             # --- Вывод сообщения в Received messages (recv_area) ---
-            # Выводим только само сообщение, как было запрошено.
-            if frame_structure.decoded_text:
-                self.recv_area.appendPlainText(frame_structure.decoded_text)
+            if decoded_text:
+                self.recv_area.appendPlainText(decoded_text)
             else:
                 self.recv_area.appendPlainText("[Empty Message]")
-
 
     def _on_error(self, text: str):
         self.log(f"ERROR: {text}")
@@ -818,12 +819,12 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def main():
+def run_app():
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    run_app()
