@@ -1,7 +1,7 @@
 import sys
 import threading
 import math
-import re  # Добавлен для извлечения адреса из имени порта
+import re
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QComboBox, QHBoxLayout, QVBoxLayout, QPlainTextEdit, QLineEdit, QMessageBox,
@@ -11,6 +11,55 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QIcon
 import serial
 import serial.tools.list_ports
+
+
+# ---------------- Frame Structure Class ----------------
+# Новый класс для инкапсуляции разобранной структуры кадра.
+class FrameStructure:
+    """Хранит и форматирует информацию о разобранном (декадрированном) кадре."""
+
+    def __init__(self, tx_bin: str, rx_bin: str, length_bin: str, data_bin: str,
+                 de_stuffed_body: str, decoded_text: str):
+        self.FLAG = FrameProcessor.FLAG
+        self.tx_bin = tx_bin
+        self.rx_bin = rx_bin
+        self.length_bin = length_bin
+        self.data_bin = data_bin
+        self.de_stuffed_body = de_stuffed_body
+        self.decoded_text = decoded_text
+
+    def format_log(self) -> str:
+        """Форматирует техническую информацию о кадре для вывода в лог."""
+
+        # Конвертация бинарных полей в числа для лога
+        tx_addr = int(self.tx_bin, 2)
+        rx_addr = int(self.rx_bin, 2)
+        data_len_bytes = int(self.length_bin, 2)
+
+        # 1. Построение и форматирование ПОЛНОГО декадрированного кадра (FLAG + Body + FLAG)
+        full_de_stuffed_frame = self.FLAG + self.de_stuffed_body + self.FLAG
+        # Форматирование по байтам для лучшей читаемости
+        formatted_full_de_stuffed_frame = ' '.join(
+            full_de_stuffed_frame[i:i + 8] for i in range(0, len(full_de_stuffed_frame), 8))
+
+        # --- Вывод структуры декадрированного кадра с ВЫРАВНИВАНИЕМ ---
+        log_text = f"\n--- RECEIVED DE-STUFFED FRAME STRUCTURE ---\n"
+        log_text += f"FLAG:             {self.FLAG}\n"
+        log_text += f"TX:               {self.tx_bin} ({tx_addr})\n"
+        log_text += f"RX:               {self.rx_bin} ({rx_addr})\n"
+
+        length_output = f"{self.length_bin} ({data_len_bytes} bytes)"
+        log_text += f"Data Length:      {length_output}\n"
+
+        # Поле данных
+        log_text += f"Data Bits:        {self.data_bin}\n"
+
+        # Полный кадр
+        log_text += f"De-stuffed Frame (Bytes):\n"
+        log_text += f"{formatted_full_de_stuffed_frame}\n"
+        log_text += "------------------------------------------\n"
+
+        return log_text
 
 
 # ---------------- Frame Processor Logic ----------------
@@ -169,13 +218,22 @@ class FrameProcessor:
             return {
                 "error": f"Invalid frame: Data length mismatch (Expected: {length_val * 8} bits, Found: {len(data_bin)} bits)"}
 
+        # Конвертация Data в байты и затем в текст
+        data_bytes = FrameProcessor._bin_to_bytes(data_bin)
+        try:
+            # Декодируем, убирая лишние символы типа \n, \r, \t, которые могут быть в начале/конце.
+            decoded_text = data_bytes.decode("utf-8", errors="replace").strip()
+        except Exception:
+            decoded_text = repr(data_bytes)  # Используем repr для отображения байтов, если декодирование не удалось
+
         return {
             "status": "OK",
             "tx_bin": tx_bin,
             "rx_bin": rx_bin,
             "length_bin": length_bin,
             "data_bin": data_bin,
-            "de_stuffed_body": de_stuffed_body
+            "de_stuffed_body": de_stuffed_body,
+            "decoded_text": decoded_text
         }
 
 
@@ -341,9 +399,6 @@ class MainWindow(QMainWindow):
         self.worker_send = None
         self.worker_receive = None
         self.frame_window = FrameWindow(self)  # Окно истории фреймов
-
-        # Логические адреса фрейма (TX/RX) теперь будут извлекаться из имен портов.
-        # Константы self.tx_addr и self.rx_addr удалены.
 
         # UI elements
         self.port_send_cb = QComboBox()
@@ -672,15 +727,14 @@ class MainWindow(QMainWindow):
     def _on_data_received(self, data: bytes):
         # 1. Преобразование принятых байтов в бит-строку (включая мусор)
         raw_received_bin = FrameProcessor._bytes_to_bin(data)
-
         FLAG = FrameProcessor.FLAG
 
         # 2. Поиск первого флага (Start Flag)
         start_index = raw_received_bin.find(FLAG)
 
         if start_index == -1:
-            self.recv_area.appendPlainText("ERROR PARSING: Start flag not found in received data.")
-            self.log("Received data parse error: Start flag not found.")
+            self.log("Received data parse error: Start flag not found in received data.")
+            self.recv_area.appendPlainText("[ERROR] Start flag not found in data.")
             return
 
         # Удаление ведущего мусора
@@ -693,8 +747,8 @@ class MainWindow(QMainWindow):
         end_flag_start_index_in_body_section = body_and_end.rfind(FLAG)
 
         if end_flag_start_index_in_body_section == -1:
-            self.recv_area.appendPlainText("ERROR PARSING: End flag not found after start flag.")
-            self.log("Received data parse error: End flag not found.")
+            self.log("Received data parse error: End flag not found after start flag.")
+            self.recv_area.appendPlainText("[ERROR] End flag not found after start flag.")
             return
 
         # 4. Извлечение полного кадра (Start FLAG + Stuffed Body + End FLAG)
@@ -711,50 +765,29 @@ class MainWindow(QMainWindow):
         # 6. Вывод структуры декадрированного кадра
 
         if "error" in frame_parse_result:
-            self.recv_area.appendPlainText(f"--- DE-BIT-STUFFED STRUCTURE ---")
-            self.recv_area.appendPlainText(f"ERROR PARSING FRAME: {frame_parse_result['error']}")
             self.log(f"Received data parse error: {frame_parse_result['error']}")
+            self.recv_area.appendPlainText(f"[ERROR PARSING] {frame_parse_result['error']}")
         else:
-            data_bin = frame_parse_result['data_bin']
-            de_stuffed_body = frame_parse_result['de_stuffed_body']
+            # Создаем объект FrameStructure
+            frame_structure = FrameStructure(
+                tx_bin=frame_parse_result['tx_bin'],
+                rx_bin=frame_parse_result['rx_bin'],
+                length_bin=frame_parse_result['length_bin'],
+                data_bin=frame_parse_result['data_bin'],
+                de_stuffed_body=frame_parse_result['de_stuffed_body'],
+                decoded_text=frame_parse_result['decoded_text']
+            )
 
-            # Конвертация Data в байты и затем в текст
-            data_bytes = FrameProcessor._bin_to_bytes(data_bin)
-            try:
-                decoded_text = data_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                decoded_text = repr(data_bytes)
+            # --- Логирование технической информации в Application logs (log_area) ---
+            self.log(frame_structure.format_log())
 
-            # 1. Построение и форматирование ПОЛНОГО декадрированного кадра (FLAG + Body + FLAG)
-            full_de_stuffed_frame = FLAG + de_stuffed_body + FLAG
-            formatted_full_de_stuffed_frame = ' '.join(
-                full_de_stuffed_frame[i:i + 8] for i in range(0, len(full_de_stuffed_frame), 8))
+            # --- Вывод сообщения в Received messages (recv_area) ---
+            # Выводим только само сообщение, как было запрошено.
+            if frame_structure.decoded_text:
+                self.recv_area.appendPlainText(frame_structure.decoded_text)
+            else:
+                self.recv_area.appendPlainText("[Empty Message]")
 
-            # --- Вывод структуры декадрированного кадра с ВЫРАВНИВАНИЕМ ---
-
-            self.recv_area.appendPlainText(f"\n--- DE-BIT-STUFFED FRAME STRUCTURE ---")
-
-            # Выравнивание полей
-            self.recv_area.appendPlainText(f"FLAG:             {FLAG}")
-            self.recv_area.appendPlainText(
-                f"TX:               {frame_parse_result['tx_bin']} ({int(frame_parse_result['tx_bin'], 2)})")
-            self.recv_area.appendPlainText(
-                f"RX:               {frame_parse_result['rx_bin']} ({int(frame_parse_result['rx_bin'], 2)})")
-
-            length_output = f"{frame_parse_result['length_bin']} ({len(data_bytes)} bytes)"
-            self.recv_area.appendPlainText(
-                f"Data Length:      {length_output}")
-
-            # Поле данных
-            self.recv_area.appendPlainText(f"Data:             {data_bin}")
-
-            # ПОЛНЫЙ КАДР, ВКЛЮЧАЯ ФЛАГИ
-            self.recv_area.appendPlainText(f"De-stuffed Frame: {formatted_full_de_stuffed_frame}")
-
-            self.recv_area.appendPlainText(f"Received Message: {decoded_text!r}")
-            self.recv_area.appendPlainText("------------------------------------\n")
-
-            self.log(f"Received message: {decoded_text!r} (Parsed OK)")
 
     def _on_error(self, text: str):
         self.log(f"ERROR: {text}")
