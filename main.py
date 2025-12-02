@@ -280,7 +280,7 @@ class FrameWindow(QDialog):
     def log_frame_data(self, frame_info: dict, original_text: str):
         """Логирует информацию о фрейме в QPlainTextEdit."""
 
-        log_text = f"--- SENT FRAME: {original_text!r} ---\n"
+        log_text = f"--- SENT FRAME ---\n"
 
         # Фиксированное выравнивание
         log_text += f"Flag:             {FrameProcessor.FLAG}\n"
